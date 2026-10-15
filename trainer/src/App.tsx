@@ -5,12 +5,12 @@ import TaskList from "./components/TaskList";
 import TaskCard from "./components/TaskCard";
 
 export default function App() {
-  // Инициализируем state первым заданием, если оно есть
+  
   const [selectedId, setSelectedId] = useState<string | null>(
     mainSet.tasks[0]?.id ?? null
   );
 
-  // Безопасный поиск: может вернуть undefined
+  
   const currentTask = selectedId ? findTask(mainSet, selectedId) : undefined;
 
   return (
