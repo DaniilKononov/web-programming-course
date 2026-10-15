@@ -22,7 +22,7 @@ const taskReact1: Task = {
   prompt: "Объясните, чем props компонента отличаются от его состояния.",
 };
 
-const mainSet: TrainingSet = {
+export const mainSet: TrainingSet = {
   id: "web-basics",
   title: "Основы веб-программирования",
   tasks: [taskTs1, taskReact1],
