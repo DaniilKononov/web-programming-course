@@ -1,9 +1,57 @@
-import { useState } from "react";
-import type { TrainingSet, Answer, Task } from "../domain/domain.js";
-import { getProgress } from "../domain/domain.js";
+import { useState, useReducer, useEffect, useRef } from "react";
+import type { 
+  TrainingSet, 
+  Answer, 
+  Task, 
+  Draft, 
+  AttemptState, 
+  AttemptAction 
+} from "../domain/domain.js";
+import { getProgress, readDraft } from "../domain/domain.js";
 import { TaskCardForm } from "./TaskCardForm.js";
 
-type AttemptStatus = "in-progress" | "submitted";
+// Константа ключа хранилища
+const STORAGE_KEY_PREFIX = "draft-";
+
+function getStorageKey(setId: string): string {
+  return `${STORAGE_KEY_PREFIX}${setId}`;
+}
+
+// Reducer (чистая функция переходов)
+function reducer(state: AttemptState, action: AttemptAction): AttemptState {
+  switch (action.type) {
+    case "answerChanged":
+      if (state.status === "submitted") return state;
+      return { 
+        ...state, 
+        answers: [
+          ...state.answers.filter((a) => a.taskId !== action.answer.taskId),
+          action.answer,
+        ] 
+      };
+    case "moved":
+      return { ...state, currentIndex: action.index };
+    case "reset":
+      return { 
+        currentIndex: 0, 
+        answers: [], 
+        status: "in-progress",
+        storageWarning: undefined 
+      };
+    case "restored":
+      return {
+        currentIndex: 0, 
+        answers: action.draft.answers,
+        status: action.draft.status,
+      };
+    case "submitted":
+      return { ...state, status: "submitted" };
+    default:
+      return state;
+  }
+}
+
+// Компонент 
 
 type AttemptScreenProps = {
   trainingSet: TrainingSet;
@@ -11,15 +59,54 @@ type AttemptScreenProps = {
 
 export function AttemptScreen({ trainingSet }: AttemptScreenProps) {
   const tasks = trainingSet.tasks;
+  const setId = trainingSet.id;
+  const storageKey = getStorageKey(setId);
 
-  // Состояния попыток
-  const [answers, setAnswers] = useState<Answer[]>([]);
-  const [currentIndex, setCurrentIndex] = useState(0);
-  const [status, setStatus] = useState<AttemptStatus>("in-progress");
+  const initialState: AttemptState = {
+    currentIndex: 0,
+    answers: [],
+    status: "in-progress",
+  };
 
-  // Вспомогательные функции
+  const [state, dispatch] = useReducer(reducer, initialState);
+  const [uiWarning, setUiWarning] = useState<string | undefined>(undefined);
+  const isInitialMount = useRef(true);
+
+  // Эффект чтения 
+  useEffect(() => {
+    const raw = localStorage.getItem(storageKey);
+    const draft = readDraft(raw, setId);
+
+    if (draft) {
+      dispatch({ type: "restored", draft });
+    } else if (raw !== null) {
+      setUiWarning("Найден повреждённый или несовместимый черновик. Начните новую попытку.");
+    }
+    isInitialMount.current = false;
+  }, [storageKey, setId]);
+
+  // Эффект записи
+  useEffect(() => {
+    if (isInitialMount.current && uiWarning) return;
+
+    const draft: Draft = {
+      version: 1,
+      setId: setId,
+      taskId: tasks[state.currentIndex]?.id || "",
+      answers: state.answers,
+      status: state.status,
+    };
+
+    try {
+      localStorage.setItem(storageKey, JSON.stringify(draft));
+    } catch {
+      setUiWarning("Не удалось сохранить черновик. Ввод продолжается в памяти.");
+    }
+  }, [storageKey, setId, state.answers, state.status, state.currentIndex, tasks, uiWarning]);
+
+  // Вспомогательные функции UI
   const getCurrentAnswer = (taskId: string): Answer | undefined => 
-    answers.find((a) => a.taskId === taskId);
+    state.answers.find((a) => a.taskId === taskId);
 
   const isAnswered = (answer: Answer | undefined): boolean => {
     if (!answer) return false;
@@ -27,69 +114,69 @@ export function AttemptScreen({ trainingSet }: AttemptScreenProps) {
     return answer.text.trim().length > 0;
   };
 
-  // Неизменяемое обновление ответа 
-  const replaceAnswer = (nextAnswer: Answer) => {
-    setAnswers((current) => [
-      ...current.filter((a) => a.taskId !== nextAnswer.taskId),
-      nextAnswer,
-    ]);
-  };
+  const goNext = () => dispatch({ type: "moved", index: Math.min(state.currentIndex + 1, tasks.length - 1) });
+  const goPrev = () => dispatch({ type: "moved", index: Math.max(state.currentIndex - 1, 0) });
 
-  // Безопасная навигация 
-  const goNext = () => setCurrentIndex((i) => Math.min(i + 1, tasks.length - 1));
-  const goPrev = () => setCurrentIndex((i) => Math.max(i - 1, 0));
-
-  // Завершение с проверкой пропусков
   const handleFinish = () => {
     const missed = tasks.filter((task) => !isAnswered(getCurrentAnswer(task.id)));
-    
     let message = "Все задания заполнены. Завершить попытку?";
     if (missed.length > 0) {
       const numbers = missed.map(t => tasks.indexOf(t) + 1).join(", ");
       message = `Не заполнены задания №${numbers}. Всё равно завершить?`;
     }
-
     if (window.confirm(message)) {
-      setStatus("submitted");
+      dispatch({ type: "submitted" }); 
     }
   };
 
-  // Старт новой попытки 
   const handleRestart = () => {
-    setAnswers([]);
-    setCurrentIndex(0);
-    setStatus("in-progress");
+    dispatch({ type: "reset" });
+    localStorage.removeItem(storageKey); 
+    setUiWarning(undefined);
   };
 
-  // Производные значения 
-  const progress = getProgress(trainingSet, answers);
-  const currentTask = tasks[currentIndex];
+  const progress = getProgress(trainingSet, state.answers);
+  const currentTask = tasks[state.currentIndex];
   const currentAnswer = currentTask ? getCurrentAnswer(currentTask.id) : undefined;
 
-  // Завершение (submitted) 
-  if (status === "submitted") {
+  // Блок предупреждения
+  const warningBlock = uiWarning ? (
+    <div style={{ padding: "1rem", backgroundColor: "#fff3cd", border: "1px solid #ffeeba", borderRadius: "4px", marginBottom: "1rem", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+      <span>⚠️ {uiWarning}</span>
+      <button 
+        onClick={() => {
+          dispatch({ type: "reset" });
+          localStorage.removeItem(storageKey);
+          setUiWarning(undefined);
+        }}
+        style={{ marginLeft: "1rem", padding: "0.5rem 1rem", cursor: "pointer", backgroundColor: "#fff", border: "1px solid #ccc", borderRadius: "4px" }}
+      >
+        Сбросить
+      </button>
+    </div>
+  ) : null;
+
+  // Завершение
+  if (state.status === "submitted") {
     return (
       <section style={{ maxWidth: "800px", margin: "2rem auto", fontFamily: "sans-serif" }}>
         <h1>{trainingSet.title}</h1>
+        {warningBlock}
         <p style={{ fontSize: "1.2rem", marginBottom: "2rem" }}>
           Попытка завершена. Выполнено {progress.completed} из {progress.total}.
         </p>
-        
         <div style={{ border: "1px solid #eee", borderRadius: "8px", padding: "1.5rem", marginBottom: "2rem" }}>
           <h3>Обзор ответов:</h3>
           <ul style={{ listStyle: "none", padding: 0 }}>
             {tasks.map((task) => {
               const ans = getCurrentAnswer(task.id);
               let display = "Нет ответа";
-              
-              
               if (task.kind === "single-choice" && ans?.kind === "single-choice") {
                 const opt = task.options.find(o => o.id === ans.optionId);
                 display = opt ? opt.label : "Неизвестный вариант";
               } else if (ans?.kind === "short-text") {
                 display = ans.text || "(пусто)";
               }
-
               return (
                 <li key={task.id} style={{ marginBottom: "1rem", paddingBottom: "1rem", borderBottom: "1px solid #f0f0f0" }}>
                   <strong>{task.topic}:</strong> {task.prompt}
@@ -100,7 +187,6 @@ export function AttemptScreen({ trainingSet }: AttemptScreenProps) {
             })}
           </ul>
         </div>
-
         <button onClick={handleRestart} style={{ padding: "0.75rem 1.5rem", cursor: "pointer" }}>
           Начать новую попытку
         </button>
@@ -108,7 +194,7 @@ export function AttemptScreen({ trainingSet }: AttemptScreenProps) {
     );
   }
 
-  // Прохождение (in-progress)
+  // Прохождение
   if (!currentTask) return <p>Заданий нет.</p>;
 
   return (
@@ -116,25 +202,32 @@ export function AttemptScreen({ trainingSet }: AttemptScreenProps) {
       <header style={{ marginBottom: "2rem" }}>
         <h1>{trainingSet.title}</h1>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", color: "#666" }}>
-          <span>Задание {currentIndex + 1} из {tasks.length}</span>
+          <span>Задание {state.currentIndex + 1} из {tasks.length}</span>
           <span>Прогресс: {progress.completed}/{progress.total}</span>
         </div>
       </header>
 
-      {/* Контролируемая форма */}
+      {warningBlock}
+
       <TaskCardForm 
         task={currentTask} 
         answer={currentAnswer} 
-        onChange={replaceAnswer} 
+        onChange={(next) => {
+          dispatch({ type: "answerChanged", answer: next });
+          setUiWarning(undefined);
+        }} 
       />
 
-      {/* Навигация */}
       <div style={{ display: "flex", gap: "1rem", marginTop: "2rem", alignItems: "center" }}>
-        <button onClick={goPrev} disabled={currentIndex === 0} style={{ padding: "0.75rem 1.5rem", cursor: currentIndex === 0 ? "not-allowed" : "pointer" }}>
+        <button 
+          onClick={goPrev} 
+          disabled={state.currentIndex === 0} 
+          style={{ padding: "0.75rem 1.5rem", cursor: state.currentIndex === 0 ? "not-allowed" : "pointer" }}
+        >
           Назад
         </button>
         
-        {currentIndex === tasks.length - 1 ? (
+        {state.currentIndex === tasks.length - 1 ? (
           <button onClick={handleFinish} style={{ padding: "0.75rem 1.5rem", backgroundColor: "#4CAF50", color: "white", border: "none", borderRadius: "4px", cursor: "pointer" }}>
             Завершить
           </button>
