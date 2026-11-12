@@ -1,46 +1,53 @@
 import { useState, useReducer, useEffect, useRef } from "react";
-import type { 
-  TrainingSet, 
-  Answer, 
-  Task, 
-  Draft, 
-  AttemptState, 
-  AttemptAction 
+import type {
+  TrainingSet,
+  Answer,
+  Task,
+  Draft,
+  AttemptState,
+  AttemptAction
 } from "../domain/domain.js";
 import { getProgress, readDraft } from "../domain/domain.js";
 import { TaskCardForm } from "./TaskCardForm.js";
 
-// Константа ключа хранилища
 const STORAGE_KEY_PREFIX = "draft-";
 
 function getStorageKey(setId: string): string {
   return `${STORAGE_KEY_PREFIX}${setId}`;
 }
 
-// Reducer (чистая функция переходов)
+// Reducer
 function reducer(state: AttemptState, action: AttemptAction): AttemptState {
   switch (action.type) {
     case "answerChanged":
       if (state.status === "submitted") return state;
-      return { 
-        ...state, 
+      return {
+        ...state,
         answers: [
           ...state.answers.filter((a) => a.taskId !== action.answer.taskId),
           action.answer,
-        ] 
+        ]
       };
+    
+    case "answerRemoved":
+      if (state.status === "submitted") return state;
+      return {
+        ...state,
+        answers: state.answers.filter((a) => a.taskId !== action.taskId),
+      };
+
     case "moved":
       return { ...state, currentIndex: action.index };
     case "reset":
-      return { 
-        currentIndex: 0, 
-        answers: [], 
+      return {
+        currentIndex: 0,
+        answers: [],
         status: "in-progress",
-        storageWarning: undefined 
+        storageWarning: undefined
       };
     case "restored":
       return {
-        currentIndex: 0, 
+        currentIndex: 0,
         answers: action.draft.answers,
         status: action.draft.status,
       };
@@ -50,8 +57,6 @@ function reducer(state: AttemptState, action: AttemptAction): AttemptState {
       return state;
   }
 }
-
-// Компонент 
 
 type AttemptScreenProps = {
   trainingSet: TrainingSet;
@@ -71,8 +76,11 @@ export function AttemptScreen({ trainingSet }: AttemptScreenProps) {
   const [state, dispatch] = useReducer(reducer, initialState);
   const [uiWarning, setUiWarning] = useState<string | undefined>(undefined);
   const isInitialMount = useRef(true);
+  
+  // Состояние переключения между формой и обзором (только для in-progress)
+  const [isReviewMode, setIsReviewMode] = useState(false);
 
-  // Эффект чтения 
+  // Эффект чтения
   useEffect(() => {
     const raw = localStorage.getItem(storageKey);
     const draft = readDraft(raw, setId);
@@ -105,7 +113,7 @@ export function AttemptScreen({ trainingSet }: AttemptScreenProps) {
   }, [storageKey, setId, state.answers, state.status, state.currentIndex, tasks, uiWarning]);
 
   // Вспомогательные функции UI
-  const getCurrentAnswer = (taskId: string): Answer | undefined => 
+  const getCurrentAnswer = (taskId: string): Answer | undefined =>
     state.answers.find((a) => a.taskId === taskId);
 
   const isAnswered = (answer: Answer | undefined): boolean => {
@@ -125,25 +133,26 @@ export function AttemptScreen({ trainingSet }: AttemptScreenProps) {
       message = `Не заполнены задания №${numbers}. Всё равно завершить?`;
     }
     if (window.confirm(message)) {
-      dispatch({ type: "submitted" }); 
+      dispatch({ type: "submitted" });
     }
   };
 
   const handleRestart = () => {
     dispatch({ type: "reset" });
-    localStorage.removeItem(storageKey); 
+    localStorage.removeItem(storageKey);
     setUiWarning(undefined);
+    setIsReviewMode(false);
   };
 
   const progress = getProgress(trainingSet, state.answers);
   const currentTask = tasks[state.currentIndex];
   const currentAnswer = currentTask ? getCurrentAnswer(currentTask.id) : undefined;
 
-  // Блок предупреждения
+  // Общий блок предупреждения
   const warningBlock = uiWarning ? (
     <div style={{ padding: "1rem", backgroundColor: "#fff3cd", border: "1px solid #ffeeba", borderRadius: "4px", marginBottom: "1rem", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
       <span>⚠️ {uiWarning}</span>
-      <button 
+      <button
         onClick={() => {
           dispatch({ type: "reset" });
           localStorage.removeItem(storageKey);
@@ -197,6 +206,67 @@ export function AttemptScreen({ trainingSet }: AttemptScreenProps) {
   // Прохождение
   if (!currentTask) return <p>Заданий нет.</p>;
 
+  // Если включен режим обзора во время прохождения
+  if (isReviewMode) {
+    return (
+      <section style={{ maxWidth: "800px", margin: "2rem auto", fontFamily: "sans-serif" }}>
+        <header style={{ marginBottom: "2rem" }}>
+          <h1>{trainingSet.title}</h1>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", color: "#666" }}>
+            <span>Режим просмотра</span>
+            <span>Прогресс: {progress.completed}/{progress.total}</span>
+          </div>
+        </header>
+
+        {warningBlock}
+
+        <div style={{ border: "1px solid #eee", borderRadius: "8px", padding: "1.5rem", marginBottom: "2rem" }}>
+          <h3>Обзор ответов:</h3>
+          <ul style={{ listStyle: "none", padding: 0 }}>
+            {tasks.map((task) => {
+              const ans = getCurrentAnswer(task.id);
+              let display = "Нет ответа";
+              if (task.kind === "single-choice" && ans?.kind === "single-choice") {
+                const opt = task.options.find(o => o.id === ans.optionId);
+                display = opt ? opt.label : "Неизвестный вариант";
+              } else if (ans?.kind === "short-text") {
+                display = ans.text || "(пусто)";
+              }
+              
+              return (
+                <li key={task.id} style={{ marginBottom: "1rem", paddingBottom: "1rem", borderBottom: "1px solid #f0f0f0", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <div>
+                    <strong>{task.topic}:</strong> {task.prompt}
+                    <br />
+                    <em style={{ color: "#666" }}>Ваш ответ: {display}</em>
+                  </div>
+                  
+                  {/* Кнопка удаления ответа из обзора */}
+                  {ans && (
+                    <button
+                      onClick={() => dispatch({ type: "answerRemoved", taskId: task.id })}
+                      style={{ marginLeft: "1rem", padding: "0.4rem 0.8rem", cursor: "pointer", color: "#d32f2f", backgroundColor: "#fff", border: "1px solid #ffcdd2", borderRadius: "4px" }}
+                    >
+                      Удалить
+                    </button>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+
+        <button 
+          onClick={() => setIsReviewMode(false)} 
+          style={{ padding: "0.75rem 1.5rem", cursor: "pointer" }}
+        >
+          Вернуться к заданиям
+        </button>
+      </section>
+    );
+  }
+
+  // Обычная форма прохождения
   return (
     <section style={{ maxWidth: "800px", margin: "2rem auto", fontFamily: "sans-serif" }}>
       <header style={{ marginBottom: "2rem" }}>
@@ -209,24 +279,32 @@ export function AttemptScreen({ trainingSet }: AttemptScreenProps) {
 
       {warningBlock}
 
-      <TaskCardForm 
-        task={currentTask} 
-        answer={currentAnswer} 
+      <TaskCardForm
+        task={currentTask}
+        answer={currentAnswer}
         onChange={(next) => {
           dispatch({ type: "answerChanged", answer: next });
           setUiWarning(undefined);
-        }} 
+        }}
       />
 
       <div style={{ display: "flex", gap: "1rem", marginTop: "2rem", alignItems: "center" }}>
-        <button 
-          onClick={goPrev} 
-          disabled={state.currentIndex === 0} 
+        <button
+          onClick={goPrev}
+          disabled={state.currentIndex === 0}
           style={{ padding: "0.75rem 1.5rem", cursor: state.currentIndex === 0 ? "not-allowed" : "pointer" }}
         >
           Назад
         </button>
         
+        {/* Кнопка переключения в обзор */}
+        <button
+          onClick={() => setIsReviewMode(true)}
+          style={{ padding: "0.75rem 1.5rem", cursor: "pointer", marginLeft: "auto", backgroundColor: "#e3f2fd", border: "1px solid #90caf9", borderRadius: "4px" }}
+        >
+          Обзор ответов
+        </button>
+
         {state.currentIndex === tasks.length - 1 ? (
           <button onClick={handleFinish} style={{ padding: "0.75rem 1.5rem", backgroundColor: "#4CAF50", color: "white", border: "none", borderRadius: "4px", cursor: "pointer" }}>
             Завершить

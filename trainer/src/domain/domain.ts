@@ -63,6 +63,7 @@ export type AttemptState = {
 // Типы действий для useReducer 
 export type AttemptAction = 
   | { type: "answerChanged"; answer: Answer }
+  | { type: "answerRemoved"; taskId: string }
   | { type: "moved"; index: number }
   | { type: "reset" }
   | { type: "restored"; draft: Draft }
