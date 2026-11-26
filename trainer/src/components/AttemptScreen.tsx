@@ -1,62 +1,11 @@
 import { useState, useReducer, useEffect, useRef } from "react";
-import type {
-  TrainingSet,
-  Answer,
-  Task,
-  Draft,
-  AttemptState,
-  AttemptAction
-} from "../domain/domain.js";
-import { getProgress, readDraft } from "../domain/domain.js";
+import type { TrainingSet, Answer } from "../domain/domain.js";
+import { getProgress } from "../domain/domain.js";
+import type { AttemptState } from "../utils/draftValidation.js";
+import { readDraft } from "../utils/draftValidation.js";
+import { getStorageKey } from "../utils/draftStorage.js";
+import { reducer } from "../logic/attemptReducer.js";
 import { TaskCardForm } from "./TaskCardForm.js";
-
-const STORAGE_KEY_PREFIX = "draft-";
-
-function getStorageKey(setId: string): string {
-  return `${STORAGE_KEY_PREFIX}${setId}`;
-}
-
-// Reducer
-function reducer(state: AttemptState, action: AttemptAction): AttemptState {
-  switch (action.type) {
-    case "answerChanged":
-      if (state.status === "submitted") return state;
-      return {
-        ...state,
-        answers: [
-          ...state.answers.filter((a) => a.taskId !== action.answer.taskId),
-          action.answer,
-        ]
-      };
-    
-    case "answerRemoved":
-      if (state.status === "submitted") return state;
-      return {
-        ...state,
-        answers: state.answers.filter((a) => a.taskId !== action.taskId),
-      };
-
-    case "moved":
-      return { ...state, currentIndex: action.index };
-    case "reset":
-      return {
-        currentIndex: 0,
-        answers: [],
-        status: "in-progress",
-        storageWarning: undefined
-      };
-    case "restored":
-      return {
-        currentIndex: 0,
-        answers: action.draft.answers,
-        status: action.draft.status,
-      };
-    case "submitted":
-      return { ...state, status: "submitted" };
-    default:
-      return state;
-  }
-}
 
 type AttemptScreenProps = {
   trainingSet: TrainingSet;
@@ -76,15 +25,12 @@ export function AttemptScreen({ trainingSet }: AttemptScreenProps) {
   const [state, dispatch] = useReducer(reducer, initialState);
   const [uiWarning, setUiWarning] = useState<string | undefined>(undefined);
   const isInitialMount = useRef(true);
-  
-  // Состояние переключения между формой и обзором (только для in-progress)
   const [isReviewMode, setIsReviewMode] = useState(false);
 
   // Эффект чтения
   useEffect(() => {
     const raw = localStorage.getItem(storageKey);
     const draft = readDraft(raw, setId);
-
     if (draft) {
       dispatch({ type: "restored", draft });
     } else if (raw !== null) {
@@ -96,15 +42,13 @@ export function AttemptScreen({ trainingSet }: AttemptScreenProps) {
   // Эффект записи
   useEffect(() => {
     if (isInitialMount.current && uiWarning) return;
-
-    const draft: Draft = {
-      version: 1,
-      setId: setId,
+    const draft = {
+      version: 1 as const,
+      setId,
       taskId: tasks[state.currentIndex]?.id || "",
       answers: state.answers,
       status: state.status,
     };
-
     try {
       localStorage.setItem(storageKey, JSON.stringify(draft));
     } catch {
@@ -148,7 +92,6 @@ export function AttemptScreen({ trainingSet }: AttemptScreenProps) {
   const currentTask = tasks[state.currentIndex];
   const currentAnswer = currentTask ? getCurrentAnswer(currentTask.id) : undefined;
 
-  // Общий блок предупреждения
   const warningBlock = uiWarning ? (
     <div style={{ padding: "1rem", backgroundColor: "#fff3cd", border: "1px solid #ffeeba", borderRadius: "4px", marginBottom: "1rem", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
       <span>⚠️ {uiWarning}</span>
@@ -203,10 +146,9 @@ export function AttemptScreen({ trainingSet }: AttemptScreenProps) {
     );
   }
 
-  // Прохождение
   if (!currentTask) return <p>Заданий нет.</p>;
 
-  // Если включен режим обзора во время прохождения
+  // Режим обзора во время прохождения
   if (isReviewMode) {
     return (
       <section style={{ maxWidth: "800px", margin: "2rem auto", fontFamily: "sans-serif" }}>
@@ -217,9 +159,7 @@ export function AttemptScreen({ trainingSet }: AttemptScreenProps) {
             <span>Прогресс: {progress.completed}/{progress.total}</span>
           </div>
         </header>
-
         {warningBlock}
-
         <div style={{ border: "1px solid #eee", borderRadius: "8px", padding: "1.5rem", marginBottom: "2rem" }}>
           <h3>Обзор ответов:</h3>
           <ul style={{ listStyle: "none", padding: 0 }}>
@@ -232,7 +172,6 @@ export function AttemptScreen({ trainingSet }: AttemptScreenProps) {
               } else if (ans?.kind === "short-text") {
                 display = ans.text || "(пусто)";
               }
-              
               return (
                 <li key={task.id} style={{ marginBottom: "1rem", paddingBottom: "1rem", borderBottom: "1px solid #f0f0f0", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                   <div>
@@ -240,8 +179,6 @@ export function AttemptScreen({ trainingSet }: AttemptScreenProps) {
                     <br />
                     <em style={{ color: "#666" }}>Ваш ответ: {display}</em>
                   </div>
-                  
-                  {/* Кнопка удаления ответа из обзора */}
                   {ans && (
                     <button
                       onClick={() => dispatch({ type: "answerRemoved", taskId: task.id })}
@@ -255,9 +192,8 @@ export function AttemptScreen({ trainingSet }: AttemptScreenProps) {
             })}
           </ul>
         </div>
-
-        <button 
-          onClick={() => setIsReviewMode(false)} 
+        <button
+          onClick={() => setIsReviewMode(false)}
           style={{ padding: "0.75rem 1.5rem", cursor: "pointer" }}
         >
           Вернуться к заданиям
@@ -276,9 +212,7 @@ export function AttemptScreen({ trainingSet }: AttemptScreenProps) {
           <span>Прогресс: {progress.completed}/{progress.total}</span>
         </div>
       </header>
-
       {warningBlock}
-
       <TaskCardForm
         task={currentTask}
         answer={currentAnswer}
@@ -287,7 +221,23 @@ export function AttemptScreen({ trainingSet }: AttemptScreenProps) {
           setUiWarning(undefined);
         }}
       />
-
+      <div style={{ display: "flex", justifyContent: "flex-end", marginTop: "1rem" }}>
+        <button
+          onClick={() => dispatch({ type: "answerRemoved", taskId: currentTask.id })}
+          disabled={!isAnswered(currentAnswer)}
+          style={{
+            padding: "0.5rem 1rem",
+            cursor: isAnswered(currentAnswer) ? "pointer" : "not-allowed",
+            color: "#d32f2f",
+            backgroundColor: "#fff",
+            border: "1px solid #ffcdd2",
+            borderRadius: "4px",
+            opacity: isAnswered(currentAnswer) ? 1 : 0.5,
+          }}
+        >
+          Удалить
+        </button>
+      </div>
       <div style={{ display: "flex", gap: "1rem", marginTop: "2rem", alignItems: "center" }}>
         <button
           onClick={goPrev}
@@ -296,15 +246,12 @@ export function AttemptScreen({ trainingSet }: AttemptScreenProps) {
         >
           Назад
         </button>
-        
-        {/* Кнопка переключения в обзор */}
         <button
           onClick={() => setIsReviewMode(true)}
           style={{ padding: "0.75rem 1.5rem", cursor: "pointer", marginLeft: "auto", backgroundColor: "#e3f2fd", border: "1px solid #90caf9", borderRadius: "4px" }}
         >
           Обзор ответов
         </button>
-
         {state.currentIndex === tasks.length - 1 ? (
           <button onClick={handleFinish} style={{ padding: "0.75rem 1.5rem", backgroundColor: "#4CAF50", color: "white", border: "none", borderRadius: "4px", cursor: "pointer" }}>
             Завершить
