@@ -1,11 +1,27 @@
-import { useState, useReducer, useEffect, useRef } from "react";
+import { useState, useReducer, useEffect } from "react";
 import type { TrainingSet, Answer } from "../domain/domain.js";
 import { getProgress } from "../domain/domain.js";
 import type { AttemptState } from "../utils/draftValidation.js";
 import { readDraft } from "../utils/draftValidation.js";
 import { getStorageKey } from "../utils/draftStorage.js";
-import { reducer } from "../logic/attemptReducer.js";
+import { reducer } from "../logic/AttemptReducer.js";
 import { TaskCardForm } from "./TaskCardForm.js";
+import {
+  createAttempt,
+  getAttempt,
+  saveAnswer,
+  deleteAnswer,
+  submitAttempt,
+  getResult, 
+} from "../api/trainerApi.js";
+import type { Result, Attempt } from "../api/types.js";
+
+// Состояние любого HTTP-запроса
+type RequestState =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "success" }
+  | { status: "error"; message: string };
 
 type AttemptScreenProps = {
   trainingSet: TrainingSet;
@@ -20,31 +36,79 @@ export function AttemptScreen({ trainingSet }: AttemptScreenProps) {
     currentIndex: 0,
     answers: [],
     status: "in-progress",
+    attemptId: null,
   };
 
   const [state, dispatch] = useReducer(reducer, initialState);
   const [uiWarning, setUiWarning] = useState<string | undefined>(undefined);
-  const isInitialMount = useRef(true);
-  const [isReviewMode, setIsReviewMode] = useState(false);
+  const [isInitialLoad, setIsInitialLoad] = useState(true);
 
-  // Эффект чтения
-  useEffect(() => {
-    const raw = localStorage.getItem(storageKey);
-    const draft = readDraft(raw, setId);
-    if (draft) {
-      dispatch({ type: "restored", draft });
-    } else if (raw !== null) {
-      setUiWarning("Найден повреждённый или несовместимый черновик. Начните новую попытку.");
-    }
-    isInitialMount.current = false;
-  }, [storageKey, setId]);
+  // Состояния HTTP-запросов
+  const [saveRequests, setSaveRequests] = useState<Record<string, RequestState>>({});
+  const [deleteRequests, setDeleteRequests] = useState<Record<string, RequestState>>({}); 
+  const [submitRequest, setSubmitRequest] = useState<RequestState>({ status: "idle" });
+  const [result, setResult] = useState<Result | null>(null);
 
-  // Эффект записи
+  // счётчик перезапуска инициализации
+  const [initKey, setInitKey] = useState(0);
+
+  // 1. Инициализация попытки 
   useEffect(() => {
-    if (isInitialMount.current && uiWarning) return;
+    setIsInitialLoad(true); // показываем загрузку при каждом перезапуске
+    const initAttempt = async () => {
+      try {
+        // Читаем attemptId из localStorage (если есть)
+        const raw = localStorage.getItem(storageKey);
+        const draft = readDraft(raw, setId);
+        let attemptId = draft?.attemptId || null;
+        let serverAttempt: Attempt | null = null;
+
+        // Пытаемся прочитать существующую попытку с сервера
+        if (attemptId) {
+          try {
+            serverAttempt = await getAttempt(attemptId);
+          } catch (e: any) {
+            // Если 404 (сервер перезапустился) — attemptId устарел
+            if (e.message?.includes("не найдена")) {
+              attemptId = null;
+            } else {
+              throw e; // Сетевая ошибка — показываем предупреждение
+            }
+          }
+        }
+
+        // Если попытки нет — создаём новую
+        if (!attemptId) {
+          const newAttempt = await createAttempt(setId);
+          attemptId = newAttempt.id;
+          serverAttempt = newAttempt;
+        }
+
+        // Восстанавливаем ответы (серверные имеют приоритет)
+        const answers = serverAttempt?.answers || draft?.answers || [];
+        dispatch({ type: "attemptLoaded", attemptId, answers });
+
+        // завершённая попытка после перезагрузки открывает результат, а не форму
+        if (serverAttempt && serverAttempt.status === "submitted") {
+          dispatch({ type: "submitted" });
+          setResult(await getResult(serverAttempt.id));
+        }
+      } catch (e: any) {
+        setUiWarning(`Ошибка подключения: ${e.message}`);
+      } finally {
+        setIsInitialLoad(false);
+      }
+    };
+    initAttempt();
+  }, [storageKey, setId, initKey]);
+
+  // 2. Cохранение черновика в localstorage 
+  useEffect(() => {
+    if (isInitialLoad || !state.attemptId) return;
     const draft = {
       version: 1 as const,
       setId,
+      attemptId: state.attemptId,
       taskId: tasks[state.currentIndex]?.id || "",
       answers: state.answers,
       status: state.status,
@@ -52,32 +116,92 @@ export function AttemptScreen({ trainingSet }: AttemptScreenProps) {
     try {
       localStorage.setItem(storageKey, JSON.stringify(draft));
     } catch {
-      setUiWarning("Не удалось сохранить черновик. Ввод продолжается в памяти.");
+      setUiWarning("Не удалось сохранить черновик локально.");
     }
-  }, [storageKey, setId, state.answers, state.status, state.currentIndex, tasks, uiWarning]);
+  }, [storageKey, setId, state, tasks.length, isInitialLoad]);
 
-  // Вспомогательные функции UI
-  const getCurrentAnswer = (taskId: string): Answer | undefined =>
-    state.answers.find((a) => a.taskId === taskId);
+  // 3. Сохранение ответа на сервере
+  const handleSaveAnswer = async (answer: Answer) => {
+    if (!state.attemptId || state.status === "submitted") return;
 
-  const isAnswered = (answer: Answer | undefined): boolean => {
-    if (!answer) return false;
-    if (answer.kind === "single-choice") return answer.optionId.length > 0;
-    return answer.text.trim().length > 0;
+    // Обновляем локальное состояние сразу
+    dispatch({ type: "answerChanged", answer });
+    setSaveRequests((prev) => ({ ...prev, [answer.taskId]: { status: "loading" } }));
+
+    try {
+      // Пустой текст = DELETE, непустой = PUT
+      if (answer.kind === "short-text" && answer.text.trim() === "") {
+        await deleteAnswer(state.attemptId, answer.taskId);
+      } else {
+        await saveAnswer(state.attemptId, answer);
+      }
+      setSaveRequests((prev) => ({ ...prev, [answer.taskId]: { status: "success" } }));
+      setTimeout(() => {
+        setSaveRequests((prev) => ({ ...prev, [answer.taskId]: { status: "idle" } }));
+      }, 2000);
+    } catch (e: any) {
+      // В catch НЕ стираем локальный ввод — только показываем ошибку
+      setSaveRequests((prev) => ({
+        ...prev,
+        [answer.taskId]: { status: "error", message: e.message },
+      }));
+    }
   };
 
-  const goNext = () => dispatch({ type: "moved", index: Math.min(state.currentIndex + 1, tasks.length - 1) });
-  const goPrev = () => dispatch({ type: "moved", index: Math.max(state.currentIndex - 1, 0) });
+  // 3.1 Удаление ответа 
+  const handleDeleteAnswer = async (taskId: string) => {
+    if (!state.attemptId || state.status === "submitted") return;
+    setDeleteRequests((prev) => ({ ...prev, [taskId]: { status: "loading" } }));
+    try {
+      await deleteAnswer(state.attemptId, taskId);
+      dispatch({ type: "answerRemoved", taskId }); // только после подтверждения сервера
+      setDeleteRequests((prev) => ({ ...prev, [taskId]: { status: "idle" } }));
+    } catch (e: any) {
+      // Ответ остаётся на экране, ошибка видна, есть явный повтор
+      setDeleteRequests((prev) => ({
+        ...prev,
+        [taskId]: { status: "error", message: e.message },
+      }));
+    }
+  };
 
-  const handleFinish = () => {
-    const missed = tasks.filter((task) => !isAnswered(getCurrentAnswer(task.id)));
+  // 4. Явный повтор при ошибке
+  const handleRetrySave = async (taskId: string) => {
+    const answer = state.answers.find((a) => a.taskId === taskId);
+    if (answer) {
+      await handleSaveAnswer(answer);
+    }
+  };
+
+  // 5. Завершение попытки 
+  const handleFinish = async () => {
+    if (!state.attemptId) return;
+
+    const missed = tasks.filter(
+      (task) =>
+        !state.answers.find((a) => {
+          if (a.taskId !== task.id) return false;
+          if (a.kind === "short-text") return a.text.trim().length > 0;
+          return true;
+        })
+    );
+
     let message = "Все задания заполнены. Завершить попытку?";
     if (missed.length > 0) {
-      const numbers = missed.map(t => tasks.indexOf(t) + 1).join(", ");
+      const numbers = missed.map((t) => tasks.indexOf(t) + 1).join(", ");
       message = `Не заполнены задания №${numbers}. Всё равно завершить?`;
     }
-    if (window.confirm(message)) {
+
+    if (!window.confirm(message)) return;
+
+    setSubmitRequest({ status: "loading" });
+    try {
+      const res = await submitAttempt(state.attemptId);
+      setResult(res);
       dispatch({ type: "submitted" });
+      setSubmitRequest({ status: "success" });
+    } catch (e: any) {
+      setSubmitRequest({ status: "error", message: e.message });
     }
   };
 
@@ -85,61 +209,62 @@ export function AttemptScreen({ trainingSet }: AttemptScreenProps) {
     dispatch({ type: "reset" });
     localStorage.removeItem(storageKey);
     setUiWarning(undefined);
-    setIsReviewMode(false);
+    setResult(null);
+    setSubmitRequest({ status: "idle" });
+    setSaveRequests({});
+    setDeleteRequests({});
+    setInitKey((k) => k + 1); 
   };
+
+  if (isInitialLoad) {
+    return <div style={{ padding: "2rem", textAlign: "center" }}>Инициализация попытки...</div>;
+  }
 
   const progress = getProgress(trainingSet, state.answers);
   const currentTask = tasks[state.currentIndex];
-  const currentAnswer = currentTask ? getCurrentAnswer(currentTask.id) : undefined;
+  const currentAnswer = currentTask
+    ? state.answers.find((a) => a.taskId === currentTask.id)
+    : undefined;
+  const currentSaveState = currentTask ? saveRequests[currentTask.id] : undefined;
+  const currentDeleteState = currentTask ? deleteRequests[currentTask.id] : undefined;
 
-  const warningBlock = uiWarning ? (
-    <div style={{ padding: "1rem", backgroundColor: "#fff3cd", border: "1px solid #ffeeba", borderRadius: "4px", marginBottom: "1rem", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-      <span>⚠️ {uiWarning}</span>
-      <button
-        onClick={() => {
-          dispatch({ type: "reset" });
-          localStorage.removeItem(storageKey);
-          setUiWarning(undefined);
-        }}
-        style={{ marginLeft: "1rem", padding: "0.5rem 1rem", cursor: "pointer", backgroundColor: "#fff", border: "1px solid #ccc", borderRadius: "4px" }}
-      >
-        Сбросить
-      </button>
-    </div>
-  ) : null;
-
-  // Завершение
-  if (state.status === "submitted") {
+  // Экран результата
+  if (state.status === "submitted" && result) {
     return (
       <section style={{ maxWidth: "800px", margin: "2rem auto", fontFamily: "sans-serif" }}>
-        <h1>{trainingSet.title}</h1>
-        {warningBlock}
-        <p style={{ fontSize: "1.2rem", marginBottom: "2rem" }}>
-          Попытка завершена. Выполнено {progress.completed} из {progress.total}.
-        </p>
-        <div style={{ border: "1px solid #eee", borderRadius: "8px", padding: "1.5rem", marginBottom: "2rem" }}>
-          <h3>Обзор ответов:</h3>
-          <ul style={{ listStyle: "none", padding: 0 }}>
-            {tasks.map((task) => {
-              const ans = getCurrentAnswer(task.id);
-              let display = "Нет ответа";
-              if (task.kind === "single-choice" && ans?.kind === "single-choice") {
-                const opt = task.options.find(o => o.id === ans.optionId);
-                display = opt ? opt.label : "Неизвестный вариант";
-              } else if (ans?.kind === "short-text") {
-                display = ans.text || "(пусто)";
-              }
-              return (
-                <li key={task.id} style={{ marginBottom: "1rem", paddingBottom: "1rem", borderBottom: "1px solid #f0f0f0" }}>
-                  <strong>{task.topic}:</strong> {task.prompt}
-                  <br />
-                  <em style={{ color: "#666" }}>Ваш ответ: {display}</em>
-                </li>
-              );
-            })}
-          </ul>
-        </div>
-        <button onClick={handleRestart} style={{ padding: "0.75rem 1.5rem", cursor: "pointer" }}>
+        <h1>{trainingSet.title} — Результат</h1>
+
+        {/* различаем pending-review и graded, null не подменяем нулём */}
+        {result.status === "pending-review" ? (
+          <div style={{ padding: "1rem", backgroundColor: "#fff3cd", border: "1px solid #ffeeba", borderRadius: "4px", marginBottom: "1rem" }}>
+            ⏳ <strong>Ожидание проверки.</strong> Некоторые ответы требуют ручной оценки преподавателем.
+          </div>
+        ) : (
+          <div style={{ padding: "1rem", backgroundColor: "#d4edda", border: "1px solid #c3e6cb", borderRadius: "4px", marginBottom: "1rem" }}>
+            ✅ Оценка: <strong>{result.score} из {result.maxScore}</strong>
+          </div>
+        )}
+
+        <h3>Детали по заданиям:</h3>
+        <ul style={{ listStyle: "none", padding: 0 }}>
+          {result.items.map((item) => {
+            const task = tasks.find((t) => t.id === item.taskId);
+            return (
+              <li key={item.taskId} style={{ marginBottom: "1rem", padding: "0.5rem", borderBottom: "1px solid #eee" }}>
+                <strong>{task?.topic}:</strong> {task?.prompt}
+                <br />
+                <em>
+                  Статус: {item.status === "pending-review" ? "⏳ ожидание" : item.status === "correct" ? "✅ верно" : item.status === "incorrect" ? "❌ неверно" : "⚪ нет ответа"}
+                  {item.score !== null && ` (${item.score}/${item.maxScore})`}
+                </em>
+                <br />
+                <small style={{ color: "#666" }}>{item.feedback}</small>
+              </li>
+            );
+          })}
+        </ul>
+
+        <button onClick={handleRestart} style={{ padding: "0.75rem 1.5rem", cursor: "pointer", marginTop: "1rem" }}>
           Начать новую попытку
         </button>
       </section>
@@ -148,120 +273,137 @@ export function AttemptScreen({ trainingSet }: AttemptScreenProps) {
 
   if (!currentTask) return <p>Заданий нет.</p>;
 
-  // Режим обзора во время прохождения
-  if (isReviewMode) {
-    return (
-      <section style={{ maxWidth: "800px", margin: "2rem auto", fontFamily: "sans-serif" }}>
-        <header style={{ marginBottom: "2rem" }}>
-          <h1>{trainingSet.title}</h1>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", color: "#666" }}>
-            <span>Режим просмотра</span>
-            <span>Прогресс: {progress.completed}/{progress.total}</span>
-          </div>
-        </header>
-        {warningBlock}
-        <div style={{ border: "1px solid #eee", borderRadius: "8px", padding: "1.5rem", marginBottom: "2rem" }}>
-          <h3>Обзор ответов:</h3>
-          <ul style={{ listStyle: "none", padding: 0 }}>
-            {tasks.map((task) => {
-              const ans = getCurrentAnswer(task.id);
-              let display = "Нет ответа";
-              if (task.kind === "single-choice" && ans?.kind === "single-choice") {
-                const opt = task.options.find(o => o.id === ans.optionId);
-                display = opt ? opt.label : "Неизвестный вариант";
-              } else if (ans?.kind === "short-text") {
-                display = ans.text || "(пусто)";
-              }
-              return (
-                <li key={task.id} style={{ marginBottom: "1rem", paddingBottom: "1rem", borderBottom: "1px solid #f0f0f0", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                  <div>
-                    <strong>{task.topic}:</strong> {task.prompt}
-                    <br />
-                    <em style={{ color: "#666" }}>Ваш ответ: {display}</em>
-                  </div>
-                  {ans && (
-                    <button
-                      onClick={() => dispatch({ type: "answerRemoved", taskId: task.id })}
-                      style={{ marginLeft: "1rem", padding: "0.4rem 0.8rem", cursor: "pointer", color: "#d32f2f", backgroundColor: "#fff", border: "1px solid #ffcdd2", borderRadius: "4px" }}
-                    >
-                      Удалить
-                    </button>
-                  )}
-                </li>
-              );
-            })}
-          </ul>
-        </div>
-        <button
-          onClick={() => setIsReviewMode(false)}
-          style={{ padding: "0.75rem 1.5rem", cursor: "pointer" }}
-        >
-          Вернуться к заданиям
-        </button>
-      </section>
-    );
-  }
-
-  // Обычная форма прохождения
   return (
     <section style={{ maxWidth: "800px", margin: "2rem auto", fontFamily: "sans-serif" }}>
       <header style={{ marginBottom: "2rem" }}>
         <h1>{trainingSet.title}</h1>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", color: "#666" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", color: "#666" }}>
           <span>Задание {state.currentIndex + 1} из {tasks.length}</span>
           <span>Прогресс: {progress.completed}/{progress.total}</span>
         </div>
       </header>
-      {warningBlock}
+
+      {uiWarning && (
+        <div style={{ padding: "1rem", backgroundColor: "#fff3cd", border: "1px solid #ffeeba", borderRadius: "4px", marginBottom: "1rem", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span>⚠️ {uiWarning}</span>
+          {/*явный повтор инициализации */}
+          <button onClick={() => setInitKey((k) => k + 1)} style={{ marginLeft: "1rem", padding: "0.5rem 1rem", cursor: "pointer" }}>
+            Повторить
+          </button>
+        </div>
+      )}
+
       <TaskCardForm
         task={currentTask}
         answer={currentAnswer}
         onChange={(next) => {
-          dispatch({ type: "answerChanged", answer: next });
-          setUiWarning(undefined);
+          // Для radio-кнопок сохраняем сразу, для текста — только локально обновляем
+          if (next.kind === "single-choice") {
+            handleSaveAnswer(next);
+          } else {
+            dispatch({ type: "answerChanged", answer: next });
+          }
         }}
       />
-      <div style={{ display: "flex", justifyContent: "flex-end", marginTop: "1rem" }}>
-        <button
-          onClick={() => dispatch({ type: "answerRemoved", taskId: currentTask.id })}
-          disabled={!isAnswered(currentAnswer)}
-          style={{
-            padding: "0.5rem 1rem",
-            cursor: isAnswered(currentAnswer) ? "pointer" : "not-allowed",
-            color: "#d32f2f",
-            backgroundColor: "#fff",
-            border: "1px solid #ffcdd2",
-            borderRadius: "4px",
-            opacity: isAnswered(currentAnswer) ? 1 : 0.5,
-          }}
-        >
-          Удалить
-        </button>
+
+      {/* Кнопки сохранения/удаления и статусы запросов */}
+      <div style={{ display: "flex", gap: "1rem", marginTop: "1rem", alignItems: "center", flexWrap: "wrap" }}>
+        {currentAnswer && currentAnswer.kind === "short-text" && (
+          <button
+            onClick={() => handleSaveAnswer(currentAnswer)}
+            disabled={currentSaveState?.status === "loading" || !state.attemptId}
+            style={{
+              padding: "0.5rem 1rem",
+              cursor: currentSaveState?.status === "loading" ? "not-allowed" : "pointer",
+              backgroundColor: "#4CAF50",
+              color: "white",
+              border: "none",
+              borderRadius: "4px",
+              opacity: currentSaveState?.status === "loading" ? 0.6 : 1,
+            }}
+          >
+            {currentSaveState?.status === "loading" ? "Сохранение..." : "Сохранить ответ"}
+          </button>
+        )}
+
+        {currentAnswer && (
+          <button
+            onClick={() => handleDeleteAnswer(currentTask.id)}
+            disabled={currentDeleteState?.status === "loading" || !state.attemptId}
+            style={{
+              padding: "0.5rem 1rem",
+              cursor: currentDeleteState?.status === "loading" ? "not-allowed" : "pointer",
+              color: "#d32f2f",
+              backgroundColor: "#fff",
+              border: "1px solid #ffcdd2",
+              borderRadius: "4px",
+              opacity: currentDeleteState?.status === "loading" ? 0.6 : 1,
+            }}
+          >
+            {currentDeleteState?.status === "loading" ? "Очистка..." : "Очистить"}
+          </button>
+        )}
+
+        {currentSaveState?.status === "success" && <span style={{ color: "green" }}>✓ Сохранено</span>}
+        {currentSaveState?.status === "error" && (
+          <span style={{ color: "red" }}>
+            ✗ {currentSaveState.message}{" "}
+            <button onClick={() => handleRetrySave(currentTask.id)} style={{ marginLeft: "0.5rem" }}>
+              Повторить
+            </button>
+          </span>
+        )}
+        {currentDeleteState?.status === "error" && (
+          <span style={{ color: "red" }}>
+            ✗ {currentDeleteState.message}{" "}
+            <button onClick={() => handleDeleteAnswer(currentTask.id)} style={{ marginLeft: "0.5rem" }}>
+              Повторить
+            </button>
+          </span>
+        )}
       </div>
-      <div style={{ display: "flex", gap: "1rem", marginTop: "2rem", alignItems: "center" }}>
+
+      {/* Навигация */}
+      <div style={{ display: "flex", gap: "1rem", marginTop: "2rem" }}>
         <button
-          onClick={goPrev}
+          onClick={() => dispatch({ type: "moved", index: Math.max(state.currentIndex - 1, 0) })}
           disabled={state.currentIndex === 0}
           style={{ padding: "0.75rem 1.5rem", cursor: state.currentIndex === 0 ? "not-allowed" : "pointer" }}
         >
           Назад
         </button>
+
         <button
-          onClick={() => setIsReviewMode(true)}
-          style={{ padding: "0.75rem 1.5rem", cursor: "pointer", marginLeft: "auto", backgroundColor: "#e3f2fd", border: "1px solid #90caf9", borderRadius: "4px" }}
+          onClick={() => dispatch({ type: "moved", index: Math.min(state.currentIndex + 1, tasks.length - 1) })}
+          disabled={state.currentIndex === tasks.length - 1}
+          style={{ padding: "0.75rem 1.5rem", cursor: state.currentIndex === tasks.length - 1 ? "not-allowed" : "pointer", marginLeft: "auto" }}
         >
-          Обзор ответов
+          Далее
         </button>
-        {state.currentIndex === tasks.length - 1 ? (
-          <button onClick={handleFinish} style={{ padding: "0.75rem 1.5rem", backgroundColor: "#4CAF50", color: "white", border: "none", borderRadius: "4px", cursor: "pointer" }}>
-            Завершить
-          </button>
-        ) : (
-          <button onClick={goNext} style={{ padding: "0.75rem 1.5rem", cursor: "pointer" }}>
-            Далее
+
+        {state.currentIndex === tasks.length - 1 && (
+          <button
+            onClick={handleFinish}
+            disabled={submitRequest.status === "loading" || !state.attemptId}
+            style={{
+              padding: "0.75rem 1.5rem",
+              backgroundColor: "#2196F3",
+              color: "white",
+              border: "none",
+              borderRadius: "4px",
+              cursor: submitRequest.status === "loading" ? "not-allowed" : "pointer",
+            }}
+          >
+            {submitRequest.status === "loading" ? "Отправка..." : "Завершить попытку"}
           </button>
         )}
       </div>
+
+      {submitRequest.status === "error" && (
+        <div style={{ marginTop: "1rem", padding: "1rem", backgroundColor: "#f8d7da", borderRadius: "4px" }}>
+          Ошибка завершения: {submitRequest.message}
+        </div>
+      )}
     </section>
   );
 }

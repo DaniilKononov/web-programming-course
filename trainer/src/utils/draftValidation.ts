@@ -4,6 +4,7 @@ import type { Answer } from "../domain/domain.js";
 export type Draft = {
   version: 1;
   setId: string;
+  attemptId?: string | null;  
   taskId: string;
   answers: Answer[];
   status: "in-progress" | "submitted";
@@ -15,6 +16,7 @@ export type AttemptState = {
   answers: Answer[];
   status: "in-progress" | "submitted";
   storageWarning?: string;
+  attemptId: string | null;  
 };
 
 // Типы действий для useReducer 
@@ -24,7 +26,8 @@ export type AttemptAction =
   | { type: "moved"; index: number }
   | { type: "reset" }
   | { type: "restored"; draft: Draft }
-  | { type: "submitted" };
+  | { type: "submitted" }
+  | { type: "attemptLoaded"; attemptId: string; answers: Answer[] }; 
 
 //Безопасная валидация черновика из хранилища. Проверяет структуру, версию, setId и статус перед возвратом.
 
